@@ -9737,6 +9737,80 @@ private:
     std::string content_;
 };
 
+// What the host refuses in a command signature's arguments beyond each one's type and size (CreateCommandSignature,
+// measured on WARP and on a hardware D3D12 runtime, which answered alike; compared by d3d12_vulkan_device_test's
+// "command signature:" cases):
+//   - a root signature with no argument that changes a root parameter (CONSTANT, CBV, SRV, UAV);
+//   - root arguments whose parameter index does not rise, or constants of one parameter whose ranges overlap or fall;
+//   - a parameter of the wrong kind (constants against a descriptor or table, a view against constants or a table),
+//     an index past the root signature, no constants to set, or a range past the parameter's constants;
+//   - a vertex buffer view with a dispatch, an index buffer view with anything but DRAW_INDEXED, a second index
+//     buffer view, the same vertex slot twice, or a slot of 32 or more.
+// Not modelled: whether a CBV, SRV or UAV argument names a parameter of that very descriptor type (the layout does not
+// keep it). A root signature from another device has no layout here and only the index order is checked. The
+// incrementing constant counts as a root argument and is otherwise left to the caller.
+bool command_signature_arguments_valid(const D3D12_COMMAND_SIGNATURE_DESC& desc, ID3D12RootSignature* root_signature) {
+    const RootArgumentLayout* layout = root_signature ? root_signature_layout(root_signature) : nullptr;
+    const D3D12_INDIRECT_ARGUMENT_TYPE last = desc.pArgumentDescs[desc.NumArgumentDescs - 1].Type;
+    bool root_argument = false, index_buffer = false;
+    std::uint32_t vertex_slots = 0;
+    std::int64_t parameter = -1;  // the last root parameter written
+    std::uint64_t constants_end = 0;  // where the constants written to it so far end
+    for (UINT i = 0; i < desc.NumArgumentDescs; ++i) {
+        const D3D12_INDIRECT_ARGUMENT_DESC& arg = desc.pArgumentDescs[i];
+        switch (arg.Type) {
+        case D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW: {
+            if (last == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH || arg.VertexBuffer.Slot >= 32) return false;
+            const std::uint32_t bit = std::uint32_t{1} << arg.VertexBuffer.Slot;
+            if (vertex_slots & bit) return false;
+            vertex_slots |= bit;
+            break;
+        }
+        case D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW:
+            if (last == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW || last == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH) return false;
+            if (index_buffer) return false;
+            index_buffer = true;
+            break;
+        case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT: {
+            root_argument = true;
+            const std::uint64_t index = arg.Constant.RootParameterIndex;
+            const std::uint64_t first = arg.Constant.DestOffsetIn32BitValues;
+            const std::uint64_t count = arg.Constant.Num32BitValuesToSet;
+            if (std::int64_t(index) < parameter) return false;
+            if (std::int64_t(index) == parameter && first < constants_end) return false;
+            if (!count) return false;
+            if (layout) {
+                if (index >= layout->parameters.size()) return false;
+                const auto& p = layout->parameters[std::size_t(index)];
+                if (p.type != rt::rootsig::ParamType::Constants || first + count > p.constant_count) return false;
+            }
+            parameter = std::int64_t(index);
+            constants_end = first + count;
+            break;
+        }
+        case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW:
+        case D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW:
+        case D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW: {
+            root_argument = true;
+            // The three views share the layout of the first two words of the union member.
+            const std::uint64_t index = arg.ConstantBufferView.RootParameterIndex;
+            if (std::int64_t(index) <= parameter) return false;
+            if (layout) {
+                if (index >= layout->parameters.size()) return false;
+                if (layout->parameters[std::size_t(index)].type != rt::rootsig::ParamType::Descriptor) return false;
+            }
+            parameter = std::int64_t(index);
+            constants_end = 0;
+            break;
+        }
+        default:
+            if (arg.Type == compat::kIndirectArgumentIncrementingConstant) root_argument = true;
+            break;
+        }
+    }
+    return !root_signature || root_argument;
+}
+
 // The ID3DBlob GetCachedBlob returns.
 class CachedBlob final : public ID3DBlob {
 public:
@@ -16264,6 +16338,7 @@ public:
             if (draw != (i + 1 == desc->NumArgumentDescs) || (root_argument && !root_signature)) return E_INVALIDARG;
         }
         if (desc->ByteStride % 4) return E_INVALIDARG;
+        if (!command_signature_arguments_valid(*desc, root_signature)) return E_INVALIDARG;
         if (!out) return E_UNEXPECTED;  // the host's answer for a valid description and no output
         leonida::IndirectKind kind;
         switch (desc->pArgumentDescs[desc->NumArgumentDescs - 1].Type) {

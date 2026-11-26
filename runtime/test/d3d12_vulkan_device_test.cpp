@@ -2997,6 +2997,83 @@ HRESULT command_signature(ID3D12Device* device, UINT stride, std::initializer_li
     return released(device->CreateCommandSignature(&desc, nullptr, __uuidof(ID3D12CommandSignature), &out), &out);
 }
 
+// One argument of a command signature with a root signature: CONSTANT takes (root parameter, first value, count), a
+// vertex buffer view its slot, a root view its root parameter.
+struct SignatureArgument {
+    D3D12_INDIRECT_ARGUMENT_TYPE type;
+    UINT a = 0, b = 0, c = 0;
+};
+
+// CreateCommandSignature with a root signature of six parameters (0: four constants, 1: root CBV, 2: root SRV, 3: root
+// UAV, 4: two constants, 5: a descriptor table), or none when `with_root` is false. The stride is the arguments'
+// packed size plus `padding`. The host's own serializer makes the blob for both devices; with no serializer both
+// refuse the same way.
+HRESULT command_signature_rooted(ID3D12Device* device, std::initializer_list<SignatureArgument> arguments,
+                                 bool with_root = true, UINT padding = 0) {
+    using Serialize = HRESULT(WINAPI*)(const D3D12_ROOT_SIGNATURE_DESC*, D3D_ROOT_SIGNATURE_VERSION, ID3DBlob**,
+                                       ID3DBlob**);
+    static const auto serialize = reinterpret_cast<Serialize>(reinterpret_cast<void*>(GetProcAddress(
+        LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32), "D3D12SerializeRootSignature")));
+    ID3D12RootSignature* root = nullptr;
+    if (with_root) {
+        D3D12_ROOT_PARAMETER parameters[6]{};
+        parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        parameters[0].Constants = {0, 0, 4};
+        parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        parameters[1].Descriptor = {1, 0};
+        parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        parameters[2].Descriptor = {0, 0};
+        parameters[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        parameters[3].Descriptor = {0, 0};
+        parameters[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        parameters[4].Constants = {2, 0, 2};
+        const D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1, 0,
+                                           D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND};
+        parameters[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        parameters[5].DescriptorTable = {1, &range};
+        const D3D12_ROOT_SIGNATURE_DESC root_desc{6, parameters, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        ID3DBlob* blob = nullptr;
+        ID3DBlob* error = nullptr;
+        if (serialize && SUCCEEDED(serialize(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error)) && blob)
+            device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
+                                        __uuidof(ID3D12RootSignature), reinterpret_cast<void**>(&root));
+        if (blob) blob->Release();
+        if (error) error->Release();
+        if (!root) return E_FAIL;  // the same on both devices
+    }
+    std::vector<D3D12_INDIRECT_ARGUMENT_DESC> args;
+    UINT stride = padding;
+    for (const SignatureArgument& argument : arguments) {
+        D3D12_INDIRECT_ARGUMENT_DESC arg{};
+        arg.Type = argument.type;
+        switch (argument.type) {
+        case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW: stride += 16; break;
+        case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED: stride += 20; break;
+        case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH: stride += 12; break;
+        case D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW:
+            arg.VertexBuffer.Slot = argument.a;
+            stride += 16;
+            break;
+        case D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW: stride += 16; break;
+        case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT:
+            arg.Constant = {argument.a, argument.b, argument.c};
+            stride += 4 * argument.c;
+            break;
+        default:  // CBV, SRV, UAV
+            arg.ConstantBufferView.RootParameterIndex = argument.a;
+            stride += 8;
+            break;
+        }
+        args.push_back(arg);
+    }
+    const D3D12_COMMAND_SIGNATURE_DESC desc{stride, UINT(args.size()), args.data(), 0};
+    void* out = nullptr;
+    const HRESULT hr =
+        released(device->CreateCommandSignature(&desc, root, __uuidof(ID3D12CommandSignature), &out), &out);
+    if (root) root->Release();
+    return hr;
+}
+
 // CheckFeatureSupport(FORMAT_SUPPORT) for `value`: the HRESULT, or Support1 when it succeeds (Support2 holds what the
 // GPU can do, such as TILED, which the layer doesn't offer, so it isn't compared).
 HRESULT format_support1(ID3D12Device* device, UINT value) {
@@ -4208,6 +4285,105 @@ int compare_invalid_arguments(ID3D12Device* ours) {
         {"command signature: UAV without a root signature", [](ID3D12Device* d) {
              return command_signature(d, 20, {D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW,
                                               D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH});
+         }},
+        {"command signature: valid root CBV before a draw", [](ID3D12Device* d) {
+             return command_signature_rooted(d, {{D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW, 1}, {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW}});
+         }},
+        {"command signature: valid constants, CBV, SRV and UAV before a dispatch", [](ID3D12Device* d) {
+             return command_signature_rooted(d, {{D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT, 0, 0, 2}, {D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW, 1}, {D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW, 2}, {D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW, 3}, {D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH}});
+         }},
+        {"command signature: valid constants of one parameter in two ranges", [](ID3D12Device* d) {
+             return command_signature_rooted(d, {{D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT, 0, 0, 2}, {D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT, 0, 2, 2}, {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW}});
+         }},
+        {"command signature: valid constants to two parameters", [](ID3D12Device* d) {
+             return command_signature_rooted(d, {{D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT, 0, 0, 1}, {D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT, 4, 0, 2}, {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW}});
+         }},
+        {"command signature: valid vertex and index buffer views and constants before a draw_indexed", [](ID3D12Device* d) {
+             return command_signature_rooted(d, {{D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW, 1}, {D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW, 31}, {D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW}, {D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT, 0, 0, 1}, {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED}});
+         }},
+        {"command signature: a root signature and no root argument, draw", [](ID3D12Device* d) {
+             return command_signature_rooted(d, {{D3D12_INDIRECT_ARGUMENT_TYPE_DRAW}});
+         }},
+        {"command signature: a root signature and no root argument, dispatch", [](ID3D12Device* d) {
+             return command_signature_rooted(d, {{D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH}});
+         }},
+        {"command signature: a root signature and only a vertex buffer view", [](ID3D12Device* d) {
+             return command_signature_rooted(d, {{D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW, 0}, {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW}});
+         }},
+        {"command signature: root CBV twice", [](ID3D12Device* d) {
+             return command_signature_rooted(d, {{D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW, 1}, {D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW, 1}, {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW}});
+         }},
+        {"command signature: root parameters falling, constants 4 then CBV 1", [](ID3D12Device* d) {
+             return command_signature_rooted(d, {{D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT, 4, 0, 1}, {D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW, 1}, {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW}});
+         }},
+        {"command signature: root parameters falling, CBV 1 then constants 0", [](ID3D12Device* d) {
+             return command_signature_rooted(d, {{D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW, 1}, {D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT, 0, 0, 1}, {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW}});
+         }},
+        {"command signature: root parameters falling, UAV 3 then SRV 2", [](ID3D12Device* d) {
+             return command_signature_rooted(d, {{D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW, 3}, {D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW, 2}, {D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH}});
+         }},
+        {"command signature: the same constants twice", [](ID3D12Device* d) {
+             return command_signature_rooted(d, {{D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT, 0, 0, 1}, {D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT, 0, 0, 1}, {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW}});
+         }},
+        {"command signature: constants overlapping", [](ID3D12Device* d) {
+             return command_signature_rooted(d, {{D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT, 0, 0, 2}, {D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT, 0, 1, 2}, {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW}});
+         }},
+        {"command signature: constants of one parameter, the later range first", [](ID3D12Device* d) {
+             return command_signature_rooted(d, {{D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT, 0, 2, 1}, {D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT, 0, 0, 1}, {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW}});
+         }},
+        {"command signature: constants filling the parameter", [](ID3D12Device* d) {
+             return command_signature_rooted(d, {{D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT, 0, 0, 4}, {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW}});
+         }},
+        {"command signature: constants past the parameter, count", [](ID3D12Device* d) {
+             return command_signature_rooted(d, {{D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT, 0, 0, 5}, {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW}});
+         }},
+        {"command signature: constants past the parameter, offset", [](ID3D12Device* d) {
+             return command_signature_rooted(d, {{D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT, 0, 2, 4}, {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW}});
+         }},
+        {"command signature: constants of no values", [](ID3D12Device* d) {
+             return command_signature_rooted(d, {{D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT, 0, 0, 0}, {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW}});
+         }},
+        {"command signature: constants to a CBV parameter", [](ID3D12Device* d) {
+             return command_signature_rooted(d, {{D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT, 1, 0, 1}, {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW}});
+         }},
+        {"command signature: constants to a table parameter", [](ID3D12Device* d) {
+             return command_signature_rooted(d, {{D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT, 5, 0, 1}, {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW}});
+         }},
+        {"command signature: constants to a parameter past the root signature", [](ID3D12Device* d) {
+             return command_signature_rooted(d, {{D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT, 6, 0, 1}, {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW}});
+         }},
+        {"command signature: CBV on a constants parameter", [](ID3D12Device* d) {
+             return command_signature_rooted(d, {{D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW, 0}, {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW}});
+         }},
+        {"command signature: CBV on a table parameter", [](ID3D12Device* d) {
+             return command_signature_rooted(d, {{D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW, 5}, {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW}});
+         }},
+        {"command signature: CBV on a parameter past the root signature", [](ID3D12Device* d) {
+             return command_signature_rooted(d, {{D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW, 7}, {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW}});
+         }},
+        {"command signature: vertex buffer view with a dispatch", [](ID3D12Device* d) {
+             return command_signature_rooted(d, {{D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW, 0}, {D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH}});
+         }},
+        {"command signature: index buffer view with a draw", [](ID3D12Device* d) {
+             return command_signature_rooted(d, {{D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW}, {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW}});
+         }},
+        {"command signature: index buffer view with a dispatch", [](ID3D12Device* d) {
+             return command_signature_rooted(d, {{D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW}, {D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH}});
+         }},
+        {"command signature: two index buffer views", [](ID3D12Device* d) {
+             return command_signature_rooted(d, {{D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW}, {D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW}, {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED}});
+         }},
+        {"command signature: the same vertex slot twice", [](ID3D12Device* d) {
+             return command_signature_rooted(d, {{D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW, 0}, {D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW, 0}, {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW}});
+         }},
+        {"command signature: vertex slot 32", [](ID3D12Device* d) {
+             return command_signature_rooted(d, {{D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW, 32}, {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW}});
+         }},
+        {"command signature: vertex buffer view with a dispatch, no root signature", [](ID3D12Device* d) {
+             return command_signature_rooted(d, {{D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW, 0}, {D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH}}, false);
+         }},
+        {"command signature: constants with a padded stride", [](ID3D12Device* d) {
+             return command_signature_rooted(d, {{D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT, 0, 0, 2}, {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW}}, true, 8);
          }},
         {"command signature: type 99", [](ID3D12Device* d) {
              return command_signature(d, 16, {D3D12_INDIRECT_ARGUMENT_TYPE(99)});
